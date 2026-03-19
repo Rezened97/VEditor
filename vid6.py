@@ -29,6 +29,10 @@ def log(msg: str):
     st.session_state.logs.append(f"> {msg}")
 
 
+def safe_output_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
+
 def get_media_duration(path: Path) -> float:
     cmd = [ffmpeg_bin, "-i", str(path)]
     proc = subprocess.Popen(
@@ -71,95 +75,134 @@ def adjust_audio_speed(audio: Path, target_duration: float) -> Path:
     return out_file
 
 
-def process_concat_internal(inputs, output: Path):
-    temp_ts_files = []
-
-    for i, p in enumerate(inputs):
-        ts = output.with_name(f"{output.stem}_temp_{i}.ts")
-        cmd = [
-            ffmpeg_bin, "-y", "-i", str(p),
-            "-c:v", "copy",
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
-            "-f", "mpegts", str(ts)
-        ]
-        subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
-        temp_ts_files.append(ts)
-
-    list_file = output.with_name(f"{output.stem}_list.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        for ts in temp_ts_files:
-            f.write(f"file '{ts.resolve().as_posix()}'\n")
-
-    cmd_concat = [
-        ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
-        "-i", str(list_file),
-        "-c", "copy",
-        str(output)
+def normalize_video(input_path: Path, output_path: Path, keep_audio: bool = True):
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(input_path),
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
     ]
-    subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
 
-    if list_file.exists():
-        list_file.unlink()
-    for ts in temp_ts_files:
-        if ts.exists():
-            ts.unlink()
+    if keep_audio:
+        cmd += [
+            "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "2",
+        ]
+    else:
+        cmd += ["-an"]
+
+    cmd.append(str(output_path))
+    subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
+
+
+def process_concat_internal(inputs, output: Path):
+    normalized_files = []
+
+    try:
+        for i, p in enumerate(inputs):
+            norm = output.with_name(f"{output.stem}_norm_{i}.mp4")
+            normalize_video(p, norm, keep_audio=True)
+            normalized_files.append(norm)
+
+        list_file = output.with_name(f"{output.stem}_list.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for nf in normalized_files:
+                f.write(f"file '{nf.resolve().as_posix()}'\n")
+
+        cmd_concat = [
+            ffmpeg_bin, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "2",
+            str(output)
+        ]
+        subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
+
+    finally:
+        list_file = output.with_name(f"{output.stem}_list.txt")
+        if list_file.exists():
+            list_file.unlink()
+        for nf in normalized_files:
+            if nf.exists():
+                nf.unlink()
 
 
 def process_concat_external(inputs, audio: Path, output: Path):
-    temp_ts_files = []
+    normalized_files = []
 
-    for i, p in enumerate(inputs):
-        ts = output.with_name(f"{output.stem}_temp_{i}.ts")
-        cmd = [
-            ffmpeg_bin, "-y", "-i", str(p),
-            "-c:v", "copy",
+    try:
+        for i, p in enumerate(inputs):
+            norm = output.with_name(f"{output.stem}_norm_{i}.mp4")
+            normalize_video(p, norm, keep_audio=False)
+            normalized_files.append(norm)
+
+        list_file = output.with_name(f"{output.stem}_list.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for nf in normalized_files:
+                f.write(f"file '{nf.resolve().as_posix()}'\n")
+
+        temp_vid = output.with_name(f"{output.stem}_v.mp4")
+        cmd_concat = [
+            ffmpeg_bin, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
             "-an",
-            "-f", "mpegts", str(ts)
+            str(temp_vid)
         ]
-        subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
-        temp_ts_files.append(ts)
+        subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
 
-    list_file = output.with_name(f"{output.stem}_list.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        for ts in temp_ts_files:
-            f.write(f"file '{ts.resolve().as_posix()}'\n")
+        total_dur = sum(get_media_duration(p) for p in normalized_files)
+        adj_audio = adjust_audio_speed(audio, total_dur)
 
-    temp_vid = output.with_name(f"{output.stem}_v.mp4")
-    cmd_concat = [
-        ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
-        "-i", str(list_file),
-        "-c", "copy",
-        str(temp_vid)
-    ]
-    subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
+        subprocess.run([
+            ffmpeg_bin, "-y",
+            "-i", str(temp_vid),
+            "-i", str(adj_audio),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "2",
+            "-shortest",
+            str(output)
+        ], check=True, startupinfo=STARTUPINFO)
 
-    total_dur = sum(get_media_duration(p) for p in inputs)
-    adj_audio = adjust_audio_speed(audio, total_dur)
+    finally:
+        list_file = output.with_name(f"{output.stem}_list.txt")
+        temp_vid = output.with_name(f"{output.stem}_v.mp4")
 
-    subprocess.run([
-        ffmpeg_bin, "-y",
-        "-i", str(temp_vid),
-        "-i", str(adj_audio),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        str(output)
-    ], check=True, startupinfo=STARTUPINFO)
+        if list_file.exists():
+            list_file.unlink()
+        if temp_vid.exists():
+            temp_vid.unlink()
 
-    if list_file.exists():
-        list_file.unlink()
-    if temp_vid.exists():
-        temp_vid.unlink()
-    if adj_audio != audio and adj_audio.exists():
-        try:
-            adj_audio.unlink()
-        except OSError:
-            pass
-    for ts in temp_ts_files:
-        if ts.exists():
-            ts.unlink()
+        adj_audio_candidate = audio.with_name(f"{audio.stem}_adj{audio.suffix}")
+        if adj_audio_candidate.exists() and adj_audio_candidate != audio:
+            try:
+                adj_audio_candidate.unlink()
+            except OSError:
+                pass
+
+        for nf in normalized_files:
+            if nf.exists():
+                nf.unlink()
 
 
 def save_uploaded_files(uploaded_files, target_dir: Path):
@@ -189,7 +232,7 @@ if "logs" not in st.session_state:
     st.session_state.logs = []
 
 st.title("🎬 Generatore Video Multiplo")
-st.caption("Carica i file trascinandoli dentro i box qui sotto oppure cliccando su Browse files")
+st.caption("Carica i file trascinandoli nei box oppure cliccando su Browse files")
 
 with st.container(border=True):
     col1, col2 = st.columns(2)
@@ -249,6 +292,14 @@ with st.expander("Anteprima file selezionati", expanded=False):
     st.write("**BODY**", [f.name for f in bodies_up] if bodies_up else [])
     st.write("**AUDIO**", [f.name for f in audios_up] if audios_up else [])
 
+if hooks_up and bodies_up:
+    if use_lead:
+        combinations = len(hooks_up) * len(leads_up or []) * len(bodies_up) * (len(audios_up) if audio_mode == "E" and audios_up else 1)
+    else:
+        combinations = len(hooks_up) * len(bodies_up) * (len(audios_up) if audio_mode == "E" and audios_up else 1)
+
+    st.info(f"Combinazioni previste: {combinations}")
+
 run_btn = st.button("🚀 AVVIA MONTAGGIO", type="primary", use_container_width=True)
 
 if run_btn:
@@ -290,7 +341,7 @@ if run_btn:
             total = len(combos)
             count = 1
 
-            log("Avvio del processo con fix Anti-Blocco (Modalità Veloce)...")
+            log("Avvio del processo di montaggio (modalità stabile cloud)...")
 
             for idx, combo in enumerate(combos, start=1):
                 if use_lead:
@@ -316,8 +367,10 @@ if run_btn:
                 if audio:
                     name += f"_audio{audios.index(audio) + 1}"
 
+                name = safe_output_name(name)
                 out_path = output_dir / f"{name}.mp4"
-                status.info(f"Elaborazione: {name}.mp4")
+
+                status.info(f"Elaborazione {idx}/{total}: {name}.mp4")
                 log(f"Elaborazione: {name}.mp4")
 
                 if audio_mode == "E":
@@ -359,7 +412,7 @@ if run_btn:
 
     except subprocess.CalledProcessError as e:
         st.error(f"Errore FFmpeg: {e}")
-        log("❌ ERRORE FFMPEG!")
+        log(f"❌ ERRORE FFMPEG: {e}")
     except Exception as e:
         st.error(f"Errore imprevisto: {e}")
         log(f"❌ ERRORE IMPREVISTO: {e}")
