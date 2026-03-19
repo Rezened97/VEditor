@@ -3,7 +3,6 @@ import re
 import subprocess
 import tempfile
 import zipfile
-from io import BytesIO
 from pathlib import Path
 from itertools import product
 
@@ -79,11 +78,12 @@ def normalize_video(input_path: Path, output_path: Path, keep_audio: bool = True
     cmd = [
         ffmpeg_bin, "-y",
         "-i", str(input_path),
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
+        "-vf", "scale='min(1280,iw)':-2,fps=25",
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "27",
         "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
     ]
 
     if keep_audio:
@@ -91,6 +91,7 @@ def normalize_video(input_path: Path, output_path: Path, keep_audio: bool = True
             "-c:a", "aac",
             "-ar", "44100",
             "-ac", "2",
+            "-b:a", "128k",
         ]
     else:
         cmd += ["-an"]
@@ -99,75 +100,61 @@ def normalize_video(input_path: Path, output_path: Path, keep_audio: bool = True
     subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
 
 
+def preprocess_files(files, out_dir: Path, keep_audio: bool):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    processed = []
+
+    for idx, src in enumerate(files, start=1):
+        out_path = out_dir / f"{idx:03d}_{safe_output_name(src.stem)}.mp4"
+        normalize_video(src, out_path, keep_audio=keep_audio)
+        processed.append(out_path)
+
+    return processed
+
+
 def process_concat_internal(inputs, output: Path):
-    normalized_files = []
+    list_file = output.with_name(f"{output.stem}_list.txt")
 
     try:
-        for i, p in enumerate(inputs):
-            norm = output.with_name(f"{output.stem}_norm_{i}.mp4")
-            normalize_video(p, norm, keep_audio=True)
-            normalized_files.append(norm)
-
-        list_file = output.with_name(f"{output.stem}_list.txt")
         with open(list_file, "w", encoding="utf-8") as f:
-            for nf in normalized_files:
-                f.write(f"file '{nf.resolve().as_posix()}'\n")
+            for p in inputs:
+                f.write(f"file '{p.resolve().as_posix()}'\n")
 
         cmd_concat = [
             ffmpeg_bin, "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(list_file),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-ar", "44100",
-            "-ac", "2",
-            str(output)
+            "-c", "copy",
+            str(output),
         ]
         subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
 
     finally:
-        list_file = output.with_name(f"{output.stem}_list.txt")
         if list_file.exists():
             list_file.unlink()
-        for nf in normalized_files:
-            if nf.exists():
-                nf.unlink()
 
 
 def process_concat_external(inputs, audio: Path, output: Path):
-    normalized_files = []
+    list_file = output.with_name(f"{output.stem}_list.txt")
+    temp_vid = output.with_name(f"{output.stem}_v.mp4")
 
     try:
-        for i, p in enumerate(inputs):
-            norm = output.with_name(f"{output.stem}_norm_{i}.mp4")
-            normalize_video(p, norm, keep_audio=False)
-            normalized_files.append(norm)
-
-        list_file = output.with_name(f"{output.stem}_list.txt")
         with open(list_file, "w", encoding="utf-8") as f:
-            for nf in normalized_files:
-                f.write(f"file '{nf.resolve().as_posix()}'\n")
+            for p in inputs:
+                f.write(f"file '{p.resolve().as_posix()}'\n")
 
-        temp_vid = output.with_name(f"{output.stem}_v.mp4")
         cmd_concat = [
             ffmpeg_bin, "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(list_file),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            str(temp_vid)
+            "-c", "copy",
+            str(temp_vid),
         ]
         subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
 
-        total_dur = sum(get_media_duration(p) for p in normalized_files)
+        total_dur = sum(get_media_duration(p) for p in inputs)
         adj_audio = adjust_audio_speed(audio, total_dur)
 
         subprocess.run([
@@ -185,9 +172,6 @@ def process_concat_external(inputs, audio: Path, output: Path):
         ], check=True, startupinfo=STARTUPINFO)
 
     finally:
-        list_file = output.with_name(f"{output.stem}_list.txt")
-        temp_vid = output.with_name(f"{output.stem}_v.mp4")
-
         if list_file.exists():
             list_file.unlink()
         if temp_vid.exists():
@@ -199,10 +183,6 @@ def process_concat_external(inputs, audio: Path, output: Path):
                 adj_audio_candidate.unlink()
             except OSError:
                 pass
-
-        for nf in normalized_files:
-            if nf.exists():
-                nf.unlink()
 
 
 def save_uploaded_files(uploaded_files, target_dir: Path):
@@ -216,14 +196,11 @@ def save_uploaded_files(uploaded_files, target_dir: Path):
     return saved
 
 
-def zip_folder_to_bytes(folder: Path) -> bytes:
-    mem_zip = BytesIO()
-    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+def zip_folder_to_file(folder: Path, zip_path: Path):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file_path in folder.rglob("*"):
             if file_path.is_file():
                 zf.write(file_path, file_path.relative_to(folder))
-    mem_zip.seek(0)
-    return mem_zip.getvalue()
 
 
 st.set_page_config(page_title="Automazione Montaggio Video", layout="wide")
@@ -294,9 +271,13 @@ with st.expander("Anteprima file selezionati", expanded=False):
 
 if hooks_up and bodies_up:
     if use_lead:
-        combinations = len(hooks_up) * len(leads_up or []) * len(bodies_up) * (len(audios_up) if audio_mode == "E" and audios_up else 1)
+        combinations = len(hooks_up) * len(leads_up or []) * len(bodies_up) * (
+            len(audios_up) if audio_mode == "E" and audios_up else 1
+        )
     else:
-        combinations = len(hooks_up) * len(bodies_up) * (len(audios_up) if audio_mode == "E" and audios_up else 1)
+        combinations = len(hooks_up) * len(bodies_up) * (
+            len(audios_up) if audio_mode == "E" and audios_up else 1
+        )
 
     st.info(f"Combinazioni previste: {combinations}")
 
@@ -328,10 +309,28 @@ if run_btn:
             input_dir.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            hooks = save_uploaded_files(hooks_up, input_dir / "hooks")
-            bodies = save_uploaded_files(bodies_up, input_dir / "bodies")
-            leads = save_uploaded_files(leads_up, input_dir / "leads") if use_lead else []
+            raw_hooks = save_uploaded_files(hooks_up, input_dir / "hooks_raw")
+            raw_bodies = save_uploaded_files(bodies_up, input_dir / "bodies_raw")
+            raw_leads = save_uploaded_files(leads_up, input_dir / "leads_raw") if use_lead else []
             audios = save_uploaded_files(audios_up, input_dir / "audios") if audio_mode == "E" else []
+
+            status.info("Normalizzazione HOOK...")
+            log("Normalizzazione HOOK...")
+            hooks = preprocess_files(raw_hooks, input_dir / "hooks_norm", keep_audio=(audio_mode == "I"))
+            progress.progress(0.1)
+
+            if use_lead:
+                status.info("Normalizzazione LEAD...")
+                log("Normalizzazione LEAD...")
+                leads = preprocess_files(raw_leads, input_dir / "leads_norm", keep_audio=(audio_mode == "I"))
+            else:
+                leads = []
+            progress.progress(0.25)
+
+            status.info("Normalizzazione BODY...")
+            log("Normalizzazione BODY...")
+            bodies = preprocess_files(raw_bodies, input_dir / "bodies_norm", keep_audio=(audio_mode == "I"))
+            progress.progress(0.4)
 
             if use_lead:
                 combos = list(product(hooks, leads, bodies, audios)) if audio_mode == "E" else list(product(hooks, leads, bodies))
@@ -341,7 +340,10 @@ if run_btn:
             total = len(combos)
             count = 1
 
-            log("Avvio del processo di montaggio (modalità stabile cloud)...")
+            log("Avvio del processo di montaggio (modalità ottimizzata cloud)...")
+
+            start_progress = 0.4
+            remaining_progress = 0.5
 
             for idx, combo in enumerate(combos, start=1):
                 if use_lead:
@@ -378,8 +380,15 @@ if run_btn:
                 else:
                     process_concat_internal(inputs, out_path)
 
-                progress.progress(idx / total)
+                current_progress = start_progress + (idx / total) * remaining_progress
+                progress.progress(min(current_progress, 0.9))
                 count += 1
+
+            log("Creazione ZIP finale...")
+            status.info("Creazione ZIP finale...")
+            zip_path = tmp_dir / "video_finali.zip"
+            zip_folder_to_file(output_dir, zip_path)
+            progress.progress(1.0)
 
             log("✅ PROCESSO COMPLETATO!")
             status.success(f"Generati {count - 1} video")
@@ -391,24 +400,24 @@ if run_btn:
             elif len(generated_files) == 1:
                 single_file = generated_files[0]
                 st.success(f"Video pronto: {single_file.name}")
-                st.video(str(single_file))
-                st.download_button(
-                    "⬇️ Scarica video",
-                    data=single_file.read_bytes(),
-                    file_name=single_file.name,
-                    mime="video/mp4",
-                    use_container_width=True,
-                )
+                with open(single_file, "rb") as f:
+                    st.download_button(
+                        "⬇️ Scarica video",
+                        data=f,
+                        file_name=single_file.name,
+                        mime="video/mp4",
+                        use_container_width=True,
+                    )
             else:
-                zip_bytes = zip_folder_to_bytes(output_dir)
                 st.success(f"Generati {len(generated_files)} video")
-                st.download_button(
-                    "⬇️ Scarica tutti i video in ZIP",
-                    data=zip_bytes,
-                    file_name="video_finali.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
+                with open(zip_path, "rb") as f:
+                    st.download_button(
+                        "⬇️ Scarica tutti i video in ZIP",
+                        data=f,
+                        file_name="video_finali.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
 
     except subprocess.CalledProcessError as e:
         st.error(f"Errore FFmpeg: {e}")
