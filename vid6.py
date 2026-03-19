@@ -3,7 +3,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import zipfile
 from pathlib import Path
 from itertools import product
 
@@ -197,22 +196,13 @@ def save_uploaded_files(uploaded_files, target_dir: Path):
     return saved
 
 
-def zip_folder_to_file(folder: Path, zip_path: Path):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in folder.rglob("*"):
-            if file_path.is_file():
-                zf.write(file_path, file_path.relative_to(folder))
-
-
 def init_state():
     if "logs" not in st.session_state:
         st.session_state.logs = []
     if "job_dir" not in st.session_state:
         st.session_state.job_dir = None
-    if "zip_path" not in st.session_state:
-        st.session_state.zip_path = None
-    if "single_file_path" not in st.session_state:
-        st.session_state.single_file_path = None
+    if "generated_files" not in st.session_state:
+        st.session_state.generated_files = []
     if "generated_count" not in st.session_state:
         st.session_state.generated_count = 0
     if "job_ready" not in st.session_state:
@@ -228,8 +218,7 @@ def reset_previous_job():
             pass
 
     st.session_state.job_dir = None
-    st.session_state.zip_path = None
-    st.session_state.single_file_path = None
+    st.session_state.generated_files = []
     st.session_state.generated_count = 0
     st.session_state.job_ready = False
 
@@ -373,7 +362,7 @@ if run_btn:
         log("Avvio del processo di montaggio (modalità ottimizzata cloud)...")
 
         start_progress = 0.4
-        remaining_progress = 0.5
+        remaining_progress = 0.6
 
         for idx, combo in enumerate(combos, start=1):
             if use_lead:
@@ -411,29 +400,13 @@ if run_btn:
                 process_concat_internal(inputs, out_path)
 
             current_progress = start_progress + (idx / total) * remaining_progress
-            progress.progress(min(current_progress, 0.9))
+            progress.progress(min(current_progress, 1.0))
             count += 1
 
         generated_files = sorted(output_dir.glob("*.mp4"))
+        st.session_state.generated_files = [str(p) for p in generated_files]
         st.session_state.generated_count = len(generated_files)
-
-        if not generated_files:
-            st.warning("Nessun file video generato.")
-            st.stop()
-
-        if len(generated_files) == 1:
-            st.session_state.single_file_path = str(generated_files[0])
-            st.session_state.zip_path = None
-        else:
-            log("Creazione ZIP finale...")
-            status.info("Creazione ZIP finale...")
-            zip_path = job_dir / "video_finali.zip"
-            zip_folder_to_file(output_dir, zip_path)
-            st.session_state.zip_path = str(zip_path)
-            st.session_state.single_file_path = None
-
         st.session_state.job_ready = True
-        progress.progress(1.0)
 
         log("✅ PROCESSO COMPLETATO!")
         status.success(f"Generati {st.session_state.generated_count} video")
@@ -448,31 +421,26 @@ if run_btn:
 if st.session_state.job_ready:
     st.success(f"Output pronto. File generati: {st.session_state.generated_count}")
 
-    single_file_path = st.session_state.get("single_file_path")
-    zip_path = st.session_state.get("zip_path")
+    generated_paths = [
+        Path(p) for p in st.session_state.get("generated_files", [])
+        if Path(p).exists()
+    ]
 
-    if single_file_path and Path(single_file_path).exists():
-        with open(single_file_path, "rb") as f:
-            st.download_button(
-                "⬇️ Scarica video",
-                data=f.read(),
-                file_name=Path(single_file_path).name,
-                mime="video/mp4",
-                on_click="ignore",
-                width="stretch",
-            )
-    elif zip_path and Path(zip_path).exists():
-        with open(zip_path, "rb") as f:
-            st.download_button(
-                "⬇️ Scarica tutti i video in ZIP",
-                data=f.read(),
-                file_name="video_finali.zip",
-                mime="application/zip",
-                on_click="ignore",
-                width="stretch",
-            )
+    if not generated_paths:
+        st.error("I file generati non sono più disponibili nella sessione corrente. Rigenera il batch.")
     else:
-        st.error("Il file finale non è più disponibile nella sessione corrente. Rigenera il batch.")
+        st.subheader("Download video")
+        for idx, file_path in enumerate(generated_paths, start=1):
+            with open(file_path, "rb") as f:
+                st.download_button(
+                    label=f"⬇️ Scarica {file_path.name}",
+                    data=f.read(),
+                    file_name=file_path.name,
+                    mime="video/mp4",
+                    key=f"download_{idx}_{file_path.name}",
+                    on_click="ignore",
+                    width="stretch",
+                )
 
 if st.session_state.logs:
     st.subheader("Console Log")
