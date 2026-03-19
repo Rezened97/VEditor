@@ -1,6 +1,5 @@
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -26,7 +25,6 @@ if os.name == "nt":
     STARTUPINFO = si
 
 
-# ---------- Helpers ----------
 def log(msg: str):
     st.session_state.logs.append(f"> {msg}")
 
@@ -73,7 +71,6 @@ def adjust_audio_speed(audio: Path, target_duration: float) -> Path:
     return out_file
 
 
-# ---------- Process functions ----------
 def process_concat_internal(inputs, output: Path):
     temp_ts_files = []
 
@@ -165,11 +162,12 @@ def process_concat_external(inputs, audio: Path, output: Path):
             ts.unlink()
 
 
-# ---------- Uploaded files handling ----------
 def save_uploaded_files(uploaded_files, target_dir: Path):
+    target_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     for up in uploaded_files:
-        out_path = target_dir / up.name
+        safe_name = Path(up.name).name
+        out_path = target_dir / safe_name
         out_path.write_bytes(up.getbuffer())
         saved.append(out_path)
     return saved
@@ -185,14 +183,13 @@ def zip_folder_to_bytes(folder: Path) -> bytes:
     return mem_zip.getvalue()
 
 
-# ---------- UI ----------
 st.set_page_config(page_title="Automazione Montaggio Video", layout="wide")
 
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
 st.title("🎬 Generatore Video Multiplo")
-st.caption("Versione web Streamlit del tuo montatore video")
+st.caption("Carica i file trascinandoli dentro i box qui sotto oppure cliccando su Browse files")
 
 with st.container(border=True):
     col1, col2 = st.columns(2)
@@ -365,7 +362,7 @@ if run_btn:
         log("❌ ERRORE FFMPEG!")
     except Exception as e:
         st.error(f"Errore imprevisto: {e}")
-        log("❌ ERRORE IMPREVISTO!")
+        log(f"❌ ERRORE IMPREVISTO: {e}")
 
 if st.session_state.logs:
     st.subheader("Console Log")
