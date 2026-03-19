@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -203,11 +204,39 @@ def zip_folder_to_file(folder: Path, zip_path: Path):
                 zf.write(file_path, file_path.relative_to(folder))
 
 
+def init_state():
+    if "logs" not in st.session_state:
+        st.session_state.logs = []
+    if "job_dir" not in st.session_state:
+        st.session_state.job_dir = None
+    if "zip_path" not in st.session_state:
+        st.session_state.zip_path = None
+    if "single_file_path" not in st.session_state:
+        st.session_state.single_file_path = None
+    if "generated_count" not in st.session_state:
+        st.session_state.generated_count = 0
+    if "job_ready" not in st.session_state:
+        st.session_state.job_ready = False
+
+
+def reset_previous_job():
+    old_job_dir = st.session_state.get("job_dir")
+    if old_job_dir and Path(old_job_dir).exists():
+        try:
+            shutil.rmtree(old_job_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    st.session_state.job_dir = None
+    st.session_state.zip_path = None
+    st.session_state.single_file_path = None
+    st.session_state.generated_count = 0
+    st.session_state.job_ready = False
+
+
+init_state()
+
 st.set_page_config(page_title="Automazione Montaggio Video", layout="wide")
-
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-
 st.title("🎬 Generatore Video Multiplo")
 st.caption("Carica i file trascinandoli nei box oppure cliccando su Browse files")
 
@@ -278,13 +307,13 @@ if hooks_up and bodies_up:
         combinations = len(hooks_up) * len(bodies_up) * (
             len(audios_up) if audio_mode == "E" and audios_up else 1
         )
-
     st.info(f"Combinazioni previste: {combinations}")
 
-run_btn = st.button("🚀 AVVIA MONTAGGIO", type="primary", use_container_width=True)
+run_btn = st.button("🚀 AVVIA MONTAGGIO", type="primary", width="stretch")
 
 if run_btn:
     st.session_state.logs = []
+    reset_previous_job()
 
     if not hooks_up or not bodies_up:
         st.error("Seleziona almeno un file HOOK e un file BODY.")
@@ -302,122 +331,112 @@ if run_btn:
     status = st.empty()
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            input_dir = tmp_dir / "inputs"
-            output_dir = tmp_dir / "video_finali"
-            input_dir.mkdir(parents=True, exist_ok=True)
-            output_dir.mkdir(parents=True, exist_ok=True)
+        job_dir = Path(tempfile.mkdtemp(prefix="vidgen_"))
+        input_dir = job_dir / "inputs"
+        output_dir = job_dir / "video_finali"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            raw_hooks = save_uploaded_files(hooks_up, input_dir / "hooks_raw")
-            raw_bodies = save_uploaded_files(bodies_up, input_dir / "bodies_raw")
-            raw_leads = save_uploaded_files(leads_up, input_dir / "leads_raw") if use_lead else []
-            audios = save_uploaded_files(audios_up, input_dir / "audios") if audio_mode == "E" else []
+        st.session_state.job_dir = str(job_dir)
 
-            status.info("Normalizzazione HOOK...")
-            log("Normalizzazione HOOK...")
-            hooks = preprocess_files(raw_hooks, input_dir / "hooks_norm", keep_audio=(audio_mode == "I"))
-            progress.progress(0.1)
+        raw_hooks = save_uploaded_files(hooks_up, input_dir / "hooks_raw")
+        raw_bodies = save_uploaded_files(bodies_up, input_dir / "bodies_raw")
+        raw_leads = save_uploaded_files(leads_up, input_dir / "leads_raw") if use_lead else []
+        audios = save_uploaded_files(audios_up, input_dir / "audios") if audio_mode == "E" else []
 
+        status.info("Normalizzazione HOOK...")
+        log("Normalizzazione HOOK...")
+        hooks = preprocess_files(raw_hooks, input_dir / "hooks_norm", keep_audio=(audio_mode == "I"))
+        progress.progress(0.1)
+
+        if use_lead:
+            status.info("Normalizzazione LEAD...")
+            log("Normalizzazione LEAD...")
+            leads = preprocess_files(raw_leads, input_dir / "leads_norm", keep_audio=(audio_mode == "I"))
+        else:
+            leads = []
+        progress.progress(0.25)
+
+        status.info("Normalizzazione BODY...")
+        log("Normalizzazione BODY...")
+        bodies = preprocess_files(raw_bodies, input_dir / "bodies_norm", keep_audio=(audio_mode == "I"))
+        progress.progress(0.4)
+
+        if use_lead:
+            combos = list(product(hooks, leads, bodies, audios)) if audio_mode == "E" else list(product(hooks, leads, bodies))
+        else:
+            combos = list(product(hooks, bodies, audios)) if audio_mode == "E" else list(product(hooks, bodies))
+
+        total = len(combos)
+        count = 1
+
+        log("Avvio del processo di montaggio (modalità ottimizzata cloud)...")
+
+        start_progress = 0.4
+        remaining_progress = 0.5
+
+        for idx, combo in enumerate(combos, start=1):
             if use_lead:
-                status.info("Normalizzazione LEAD...")
-                log("Normalizzazione LEAD...")
-                leads = preprocess_files(raw_leads, input_dir / "leads_norm", keep_audio=(audio_mode == "I"))
-            else:
-                leads = []
-            progress.progress(0.25)
-
-            status.info("Normalizzazione BODY...")
-            log("Normalizzazione BODY...")
-            bodies = preprocess_files(raw_bodies, input_dir / "bodies_norm", keep_audio=(audio_mode == "I"))
-            progress.progress(0.4)
-
-            if use_lead:
-                combos = list(product(hooks, leads, bodies, audios)) if audio_mode == "E" else list(product(hooks, leads, bodies))
-            else:
-                combos = list(product(hooks, bodies, audios)) if audio_mode == "E" else list(product(hooks, bodies))
-
-            total = len(combos)
-            count = 1
-
-            log("Avvio del processo di montaggio (modalità ottimizzata cloud)...")
-
-            start_progress = 0.4
-            remaining_progress = 0.5
-
-            for idx, combo in enumerate(combos, start=1):
-                if use_lead:
-                    if audio_mode == "E":
-                        hook, lead, body, audio = combo
-                        inputs = [hook, lead, body]
-                    else:
-                        hook, lead, body = combo
-                        audio = None
-                        inputs = [hook, lead, body]
-                else:
-                    if audio_mode == "E":
-                        hook, body, audio = combo
-                    else:
-                        hook, body = combo
-                        audio = None
-                    inputs = [hook, body]
-
-                name = f"video{count}_hook{hooks.index(hook) + 1}"
-                if use_lead:
-                    name += f"_lead{leads.index(lead) + 1}"
-                name += f"_body{bodies.index(body) + 1}"
-                if audio:
-                    name += f"_audio{audios.index(audio) + 1}"
-
-                name = safe_output_name(name)
-                out_path = output_dir / f"{name}.mp4"
-
-                status.info(f"Elaborazione {idx}/{total}: {name}.mp4")
-                log(f"Elaborazione: {name}.mp4")
-
                 if audio_mode == "E":
-                    process_concat_external(inputs, audio, out_path)
+                    hook, lead, body, audio = combo
+                    inputs = [hook, lead, body]
                 else:
-                    process_concat_internal(inputs, out_path)
+                    hook, lead, body = combo
+                    audio = None
+                    inputs = [hook, lead, body]
+            else:
+                if audio_mode == "E":
+                    hook, body, audio = combo
+                else:
+                    hook, body = combo
+                    audio = None
+                inputs = [hook, body]
 
-                current_progress = start_progress + (idx / total) * remaining_progress
-                progress.progress(min(current_progress, 0.9))
-                count += 1
+            name = f"video{count}_hook{hooks.index(hook) + 1}"
+            if use_lead:
+                name += f"_lead{leads.index(lead) + 1}"
+            name += f"_body{bodies.index(body) + 1}"
+            if audio:
+                name += f"_audio{audios.index(audio) + 1}"
 
+            name = safe_output_name(name)
+            out_path = output_dir / f"{name}.mp4"
+
+            status.info(f"Elaborazione {idx}/{total}: {name}.mp4")
+            log(f"Elaborazione: {name}.mp4")
+
+            if audio_mode == "E":
+                process_concat_external(inputs, audio, out_path)
+            else:
+                process_concat_internal(inputs, out_path)
+
+            current_progress = start_progress + (idx / total) * remaining_progress
+            progress.progress(min(current_progress, 0.9))
+            count += 1
+
+        generated_files = sorted(output_dir.glob("*.mp4"))
+        st.session_state.generated_count = len(generated_files)
+
+        if not generated_files:
+            st.warning("Nessun file video generato.")
+            st.stop()
+
+        if len(generated_files) == 1:
+            st.session_state.single_file_path = str(generated_files[0])
+            st.session_state.zip_path = None
+        else:
             log("Creazione ZIP finale...")
             status.info("Creazione ZIP finale...")
-            zip_path = tmp_dir / "video_finali.zip"
+            zip_path = job_dir / "video_finali.zip"
             zip_folder_to_file(output_dir, zip_path)
-            progress.progress(1.0)
+            st.session_state.zip_path = str(zip_path)
+            st.session_state.single_file_path = None
 
-            log("✅ PROCESSO COMPLETATO!")
-            status.success(f"Generati {count - 1} video")
+        st.session_state.job_ready = True
+        progress.progress(1.0)
 
-            generated_files = sorted(output_dir.glob("*.mp4"))
-
-            if not generated_files:
-                st.warning("Nessun file video generato.")
-            elif len(generated_files) == 1:
-                single_file = generated_files[0]
-                st.success(f"Video pronto: {single_file.name}")
-                with open(single_file, "rb") as f:
-                    st.download_button(
-                        "⬇️ Scarica video",
-                        data=f,
-                        file_name=single_file.name,
-                        mime="video/mp4",
-                        use_container_width=True,
-                    )
-            else:
-                st.success(f"Generati {len(generated_files)} video")
-                with open(zip_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Scarica tutti i video in ZIP",
-                        data=f,
-                        file_name="video_finali.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                    )
+        log("✅ PROCESSO COMPLETATO!")
+        status.success(f"Generati {st.session_state.generated_count} video")
 
     except subprocess.CalledProcessError as e:
         st.error(f"Errore FFmpeg: {e}")
@@ -425,6 +444,35 @@ if run_btn:
     except Exception as e:
         st.error(f"Errore imprevisto: {e}")
         log(f"❌ ERRORE IMPREVISTO: {e}")
+
+if st.session_state.job_ready:
+    st.success(f"Output pronto. File generati: {st.session_state.generated_count}")
+
+    single_file_path = st.session_state.get("single_file_path")
+    zip_path = st.session_state.get("zip_path")
+
+    if single_file_path and Path(single_file_path).exists():
+        with open(single_file_path, "rb") as f:
+            st.download_button(
+                "⬇️ Scarica video",
+                data=f.read(),
+                file_name=Path(single_file_path).name,
+                mime="video/mp4",
+                on_click="ignore",
+                width="stretch",
+            )
+    elif zip_path and Path(zip_path).exists():
+        with open(zip_path, "rb") as f:
+            st.download_button(
+                "⬇️ Scarica tutti i video in ZIP",
+                data=f.read(),
+                file_name="video_finali.zip",
+                mime="application/zip",
+                on_click="ignore",
+                width="stretch",
+            )
+    else:
+        st.error("Il file finale non è più disponibile nella sessione corrente. Rigenera il batch.")
 
 if st.session_state.logs:
     st.subheader("Console Log")
